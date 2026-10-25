@@ -1,0 +1,103 @@
+name: job
+
+# Generic cloud job runner. Dispatch only: nothing here runs on push, pull request or a schedule.
+# Job files travel through a private R2 bucket; nothing from a job is stored in this repo or in
+# Actions artifacts. See README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'R2 prefix of the job, e.g. project/episode-20261025-1 (public: shown on the run page)'
+        required: true
+        type: string
+      tasks:
+        description: 'JSON array of task names, e.g. ["part1","part3"]'
+        required: true
+        type: string
+      profile:
+        description: 'Tools to set up'
+        required: true
+        type: choice
+        options:
+          - hyperframes
+          - ffmpeg
+          - python
+          - node
+          - trigger-test
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: validate
+    if: github.actor == 'KFLCHI001'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tasks: ${{ steps.check.outputs.tasks }}
+    steps:
+      - name: Validate inputs
+        id: check
+        env:
+          INPUT_JOB: ${{ inputs.job }}
+          INPUT_TASKS: ${{ inputs.tasks }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$INPUT_JOB" =~ ^[a-z0-9][a-z0-9._/-]{2,120}$ ]] || fail 'job id must match ^[a-z0-9][a-z0-9._/-]{2,120}$'
+          [[ "$INPUT_JOB" != *..* && "$INPUT_JOB" != *//* && "$INPUT_JOB" != */ ]] || fail "job id must not contain '..' or '//' or end with '/'"
+          # \A and \z, not ^ and $: jq's regex treats $ as end of line
+          jq -e 'type == "array" and length >= 1 and length <= 20 and (unique | length) == length
+                 and all(.[]; type == "string" and test("\\A[a-zA-Z0-9._-]{1,40}\\z") and . != "." and . != "..")' \
+            <<<"$INPUT_TASKS" >/dev/null || fail 'tasks must be a JSON array of 1 to 20 unique names matching ^[a-zA-Z0-9._-]{1,40}$'
+          echo "tasks=$(jq -c . <<<"$INPUT_TASKS")" >> "$GITHUB_OUTPUT"
+          echo "OK: inputs valid, profile=$INPUT_PROFILE, tasks=$(jq length <<<"$INPUT_TASKS")"
+
+  run:
+    name: ${{ matrix.task }}
+    needs: prepare
+    # trigger-test stops after validation: no runner, no R2, no secrets.
+    if: github.actor == 'KFLCHI001' && inputs.profile != 'trigger-test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.prepare.outputs.tasks) }}
+    env:
+      JOB: ${{ inputs.job }}
+      TASK: ${{ matrix.task }}
+      PROFILE: ${{ inputs.profile }}
+      BUCKET: studio-cloud-jobs
+    steps:
+      - name: Check out runner scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: runner
+          persist-credentials: false
+
+      - name: Fetch bundle from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: bash runner/scripts/fetch-bundle.sh
+
+      - name: Set up Node
+        if: inputs.profile == 'hyperframes' || inputs.profile == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Install tools
+        run: bash runner/scripts/setup-profile.sh
+
+      - name: Run task and upload results
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: bash runner/scripts/run-task.sh
